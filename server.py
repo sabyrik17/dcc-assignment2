@@ -28,12 +28,29 @@ import counter_pb2_grpc
 from clocks import LamportClock
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+class _SafeStreamHandler(logging.StreamHandler):
+    """
+    StreamHandler that silently swallows 'I/O operation on closed file'
+    errors raised when a daemon gRPC thread logs after pytest has closed
+    its captured stdout (this happens during teardown).
+    """
+    def emit(self, record):
+        try:
+            super().emit(record)
+        except (ValueError, OSError):
+            pass
+
+
+_handler = _SafeStreamHandler()
+_handler.setFormatter(logging.Formatter(
+    fmt="%(asctime)s %(levelname)s %(message)s",
     datefmt="%H:%M:%S",
-)
+))
+
 log = logging.getLogger("counter-server")
+log.setLevel(logging.INFO)
+log.addHandler(_handler)
+log.propagate = False   # do not bubble up to root logger (pytest capture)
 
 
 class CounterServer(counter_pb2_grpc.CounterServicer):

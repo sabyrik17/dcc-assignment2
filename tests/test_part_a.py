@@ -7,7 +7,7 @@ invariant, exactly as required by Task C2.
 
 import threading
 
-from tests.conftest import TestClient
+from tests.conftest import CounterClient
 
 
 def test_increment_applies_delta(running_server):

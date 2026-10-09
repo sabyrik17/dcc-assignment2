@@ -1,9 +1,14 @@
-"""
+﻿"""
 Counter gRPC server.
 
 Part A: single-node counter with idempotency-key deduplication.
 Part B: Lamport logical clock instrumentation.
 Part C: replication hooks (--replica-id, --fault, --delay-ms).
+
+Fault modes:
+    --fault drop-after-recv   reply lost: client sees UNAVAILABLE
+    --fault delay             every request is slow
+    --fault delay-once        only the FIRST request is slow, then normal
 
 Run:
     python server.py --port 50051 --replica-id A
@@ -45,18 +50,34 @@ class CounterServer(counter_pb2_grpc.CounterServicer):
     def __init__(self, replica_id="A", delay_ms=0, fault=None):
         self.replica_id = replica_id
         self.delay_ms = delay_ms
-        self.fault = fault  # "drop-after-recv" | "delay" | None
+        self.fault = fault  # "drop-after-recv" | "delay" | "delay-once" | None
         self.lock = threading.Lock()
         self.values = {}
         self.seen = {}
         self.clock = LamportClock(pid=f"replica-{replica_id}")
+        self._delay_consumed = False  # for fault == "delay-once"
 
     def _log_event(self, event, detail, L):
         log.info(f"[replica-{self.replica_id}] {event} {detail} L={L}")
 
+    def _maybe_delay(self):
+        """Apply delay according to the configured fault mode."""
+        if self.delay_ms <= 0:
+            return
+        if self.fault == "delay-once":
+            with self.lock:
+                if not self._delay_consumed:
+                    self._delay_consumed = True
+                    do_delay = True
+                else:
+                    do_delay = False
+            if do_delay:
+                time.sleep(self.delay_ms / 1000.0)
+        else:
+            time.sleep(self.delay_ms / 1000.0)
+
     # -- RPC handlers ----------------------------------------------------
     def Increment(self, request, context):
-        # Lamport: RECV from client
         self.clock.receive(request.lamport_time)
         self._log_event(
             "RECV",
@@ -65,11 +86,10 @@ class CounterServer(counter_pb2_grpc.CounterServicer):
             self.clock.t,
         )
 
-        # Fault injection: slow replica
-        if self.delay_ms > 0:
-            time.sleep(self.delay_ms / 1000.0)
+        # Fault injection: delay
+        self._maybe_delay()
 
-        # Fault injection: reply lost (client sees DEADLINE/UNAVAILABLE)
+        # Fault injection: reply lost
         if self.fault == "drop-after-recv":
             context.abort(grpc.StatusCode.UNAVAILABLE, "fault: drop-after-recv")
 
@@ -154,7 +174,7 @@ def main():
     parser.add_argument("--delay-ms", type=int, default=0)
     parser.add_argument(
         "--fault",
-        choices=["drop-after-recv", "delay"],
+        choices=["drop-after-recv", "delay", "delay-once"],
         default=None,
     )
     args = parser.parse_args()

@@ -1,4 +1,4 @@
-"""
+﻿"""
 Key-Value Store gRPC server (CAP Lab).
 
 Extends the Assignment 2 architecture:
@@ -6,6 +6,7 @@ Extends the Assignment 2 architecture:
   - Configurable write strategy:   QUORUM_CP (majority ack) vs ALWAYS_AP (single node ok)
   - Leaseholder emulation on port 50051 (replica A)
   - Last-Write-Wins (LWW) conflict resolution on timestamp
+  - Bounded-staleness follower reads using wall-clock age in milliseconds
 
 Run:
     python kvserver.py --port 50051 --replica-id A --is-leaseholder
@@ -37,32 +38,33 @@ log = logging.getLogger("kvserver")
 class KVServer(kvstore_pb2_grpc.KeyValueStoreServicer):
     """
     State:
-        values:     key -> (value:str, timestamp:uint64)
+        values:     key -> (value:str, timestamp:uint64, wall_ms:int)
         seen:       idempotency_key -> (key, value, timestamp)
-        clock:      local Lamport-like counter, used as fallback timestamp
+        clock:      logical counter (monotonically increasing)
 
-    Both `values` and `seen` are protected by one lock.
-    Reads with LINEARIZABLE require this node to be the leaseholder.
+    `wall_ms` is the wall-clock time (ms) at which the value was written.
+    It is used to enforce `max_staleness_ms` on FOLLOWER_STALE reads.
     """
 
     def __init__(self, replica_id="A", is_leaseholder=False):
         self.replica_id = replica_id
         self.is_leaseholder = is_leaseholder
         self.lock = threading.Lock()
-        self.values = {}   # key -> (value, ts)
+        self.values = {}   # key -> (value, ts, wall_ms)
         self.seen = {}     # idempotency_key -> (key, value, ts)
         self.clock = 0
 
     def _log_event(self, event, detail):
         log.info(f"[replica-{self.replica_id}] {event} {detail}")
 
-    # --- Put (write path) --------------------------------------------
+    # --- Put ---------------------------------------------------------
     def Put(self, request, context):
         key = request.key
         value = request.value
         ts = request.timestamp
         key_id = request.idempotency_key
         strategy = request.strategy
+        wall_ms = int(time.time() * 1000)
 
         self._log_event(
             "PUT",
@@ -72,44 +74,37 @@ class KVServer(kvstore_pb2_grpc.KeyValueStoreServicer):
         )
 
         with self.lock:
-            # idempotency check
             if key_id and key_id in self.seen:
                 k, v, t = self.seen[key_id]
                 self._log_event("PUT-DUP", f"key={k} ts={t}")
                 return kvstore_pb2.PutReply(
-                    success=True,
-                    acks_received=1,
-                    error_message="",
+                    success=True, acks_received=1, error_message="",
                 )
 
-            # Last-Write-Wins: accept only if incoming ts > stored ts
             existing = self.values.get(key)
             if existing is not None:
-                _, stored_ts = existing
+                _, stored_ts, _ = existing
                 if ts < stored_ts:
                     self._log_event(
                         "PUT-REJECT",
                         f"key={key} incoming ts={ts} < stored ts={stored_ts}",
                     )
                     return kvstore_pb2.PutReply(
-                        success=False,
-                        acks_received=0,
+                        success=False, acks_received=0,
                         error_message="stale write (LWW rejected)",
                     )
 
-            self.values[key] = (value, ts)
+            self.values[key] = (value, ts, wall_ms)
             if key_id:
                 self.seen[key_id] = (key, value, ts)
             self.clock = max(self.clock, ts) + 1
 
             self._log_event("PUT-APPLY", f"key={key} -> {value!r} ts={ts}")
             return kvstore_pb2.PutReply(
-                success=True,
-                acks_received=1,
-                error_message="",
+                success=True, acks_received=1, error_message="",
             )
 
-    # --- Get (read path) ---------------------------------------------
+    # --- Get ---------------------------------------------------------
     def Get(self, request, context):
         key = request.key
         consistency = request.consistency
@@ -128,36 +123,31 @@ class KVServer(kvstore_pb2_grpc.KeyValueStoreServicer):
             entry = self.values.get(key)
             if entry is None:
                 return kvstore_pb2.GetReply(
-                    value="",
-                    found=False,
-                    read_timestamp=0,
-                    is_stale=False,
+                    value="", found=False, read_timestamp=0, is_stale=False,
                 )
-            value, ts = entry
 
-            is_stale = False
-            # FOLLOWER_STALE staleness bound
+            value, ts, stored_wall_ms = entry
+
+            # Bounded staleness: enforce max_staleness_ms for FOLLOWER_STALE.
             if consistency == kvstore_pb2.FOLLOWER_STALE and request.max_staleness_ms > 0:
-                # We interpret "staleness" here as age of the read timestamp
-                # relative to our local clock. If it exceeds max_staleness_ms,
-                # we still return, but flag is_stale=True and (per lab spec)
-                # could abort. We return with is_stale to keep the API simple.
-                now_ms = int(time.time() * 1000)
-                # We store only logical timestamp, so use clock difference.
-                # Fallback: use abs(clock - ts) as rough staleness in logical units.
-                staleness = abs(self.clock - ts)
-                if staleness > request.max_staleness_ms:
-                    is_stale = True
+                age_ms = int(time.time() * 1000) - stored_wall_ms
+                if age_ms > request.max_staleness_ms:
+                    self._log_event(
+                        "GET-STALE-ERROR",
+                        f"key={key} age={age_ms}ms > max={request.max_staleness_ms}ms",
+                    )
+                    # Per lab spec: STALE_READ_EXCEEDED is a gRPC error.
+                    context.abort(
+                        grpc.StatusCode.FAILED_PRECONDITION,
+                        f"STALE_READ_EXCEEDED: age={age_ms}ms exceeds "
+                        f"max_staleness_ms={request.max_staleness_ms}",
+                    )
 
             self._log_event(
-                "GET-OK",
-                f"key={key} value={value!r} ts={ts} stale={is_stale}",
+                "GET-OK", f"key={key} value={value!r} ts={ts}",
             )
             return kvstore_pb2.GetReply(
-                value=value,
-                found=True,
-                read_timestamp=ts,
-                is_stale=is_stale,
+                value=value, found=True, read_timestamp=ts, is_stale=False,
             )
 
 

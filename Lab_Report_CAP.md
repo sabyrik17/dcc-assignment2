@@ -1,5 +1,4 @@
-@'
-# CAP Lab Report - Consistency Models & PACELC
+﻿# CAP Lab Report - Consistency Models & PACELC
 
 **Course:** CSS4004 - Distributed Systems
 **Lab:** Immutability, PACELC Trade-offs, and Quorum Tuning
@@ -30,11 +29,12 @@
 | `test_linearizable_on_leaseholder_ok` | LINEARIZABLE to A (leaseholder) | returns value | returns v1 | OK |
 | `test_follower_stale_on_any_replica` | FOLLOWER_STALE to B | returns value | returns v1 | OK |
 | `test_lww_merge_on_recovery` | Divergent writes + recovery | LWW picks highest ts | both v2 | OK |
+| `test_stale_read_exceeded_returns_error` | FOLLOWER_STALE with aged value | FAILED_PRECONDITION (STALE_READ_EXCEEDED) | FAILED_PRECONDITION | OK |
 
 **Run results:**
 
-    pytest tests/test_cap.py -v   ->   7 passed
-    pytest tests/ -v              ->   18 passed
+    pytest tests/test_cap.py -v   ->   8 passed
+    pytest tests/ -v              ->   19 passed
 
 ### 1.3 Quorum verification
 
@@ -44,6 +44,7 @@ Configuration: N = 3, W = 2, R = 1 (single-replica read for stale) or R = 2 (lin
 |----------|-------|-------|-----------|----------|
 | QUORUM_CP write + LINEARIZABLE read | 2 + 2 = 4 | 4 > 3 YES | Linearizable (strong) | `test_linearizable_on_leaseholder_ok` |
 | ALWAYS_AP write + FOLLOWER_STALE read | 1 + 1 = 2 | 2 <= 3 NO | Eventual (stale allowed) | `test_follower_stale_on_any_replica` |
+| FOLLOWER_STALE beyond max_staleness_ms | n/a | n/a | Error STALE_READ_EXCEEDED | `test_stale_read_exceeded_returns_error` |
 
 ---
 
@@ -61,7 +62,7 @@ Measured with `perf_cap_bench.py`: 1000 Get operations per scenario, three in-pr
 ### PACELC interpretation
 
 - **PA / EL (if Partition):** In `QUORUM_CP` mode with minority reachable, the system **chooses Consistency** over Availability - writes are rejected (`test_cp_quorum_with_minority_fails`). In `ALWAYS_AP` mode, the system **chooses Availability** - a write is accepted on a single node (`test_ap_accepts_minority_write`) and later reconciled via LWW.
-- **Else (no partition):** In `LINEARIZABLE` mode, reads go through the leaseholder and pay the extra round-trip (Latency). In `FOLLOWER_STALE` mode, reads are served locally (low Latency) with bounded staleness.
+- **Else (no partition):** In `LINEARIZABLE` mode, reads go through the leaseholder and pay the extra round-trip (Latency). In `FOLLOWER_STALE` mode, reads are served locally (low Latency) with bounded staleness enforced by `max_staleness_ms` (`test_stale_read_exceeded_returns_error`).
 
 ---
 
@@ -83,7 +84,7 @@ Under `ALWAYS_AP`, the same write is accepted on C alone. The system **chooses a
 
 ## Summary
 
-- 7 automated tests in `tests/test_cap.py` - all green.
+- 8 automated tests in `tests/test_cap.py` - all green.
 - PACELC table filled with real measurements from localhost.
 - Both conceptual questions answered with concrete reference to the code and to the tests that verify the claims.
-'@ | Set-Content -Encoding UTF8 Lab_Report_CAP.md
+- Bounded-staleness follower reads return `STALE_READ_EXCEEDED` (FAILED_PRECONDITION) when the value is older than `max_staleness_ms`.

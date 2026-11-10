@@ -193,3 +193,31 @@ def test_lww_merge_on_recovery(cluster):
     for r in ("A", "B", "C"):
         reply = get_from(cluster[r], "x", kvstore_pb2.FOLLOWER_STALE)
         assert reply.value == "v2"
+        
+
+
+# ---------------------------------------------------------------------
+# 8. Stale read exceeding max_staleness_ms -> FAILED_PRECONDITION
+# ---------------------------------------------------------------------
+
+def test_stale_read_exceeded_returns_error(cluster):
+    """
+    Write a value, artificially age it, then request FOLLOWER_STALE
+    with max_staleness_ms smaller than the age. Must return
+    FAILED_PRECONDITION (STALE_READ_EXCEEDED).
+    """
+    # Write a value on follower B via ALWAYS_AP
+    put_to([cluster["B"]], "x", "v1",
+           kvstore_pb2.ALWAYS_AP, ts=1000, key_id="stale-1")
+
+    # Manually age the stored entry: shift wall_ms 10 seconds into the past
+    with cluster["B"].impl.lock:
+        val, ts, wall_ms = cluster["B"].impl.values["x"]
+        cluster["B"].impl.values["x"] = (val, ts, wall_ms - 10_000)
+
+    # Request with max_staleness_ms = 1000 -> should error
+    with pytest.raises(grpc.RpcError) as ei:
+        get_from(cluster["B"], "x", kvstore_pb2.FOLLOWER_STALE,
+                 max_staleness_ms=1000)
+    assert ei.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+    assert "STALE_READ_EXCEEDED" in ei.value.details()

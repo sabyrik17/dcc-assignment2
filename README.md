@@ -211,3 +211,66 @@ python server.py --port 50051 --delay-ms 800 --fault delay-once  # first request
 - **`I/O operation on closed file`** during pytest teardown is swallowed by
   `_SafeStreamHandler` in `server.py`. If it reappears, ensure the handler
   is registered before any `log.info()` call.
+  
+---
+
+## CAP Lab — Consistency Models & PACELC
+
+This lab extends the counter service into a key-value store with configurable
+consistency levels and quorum tuning.
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `kvstore.proto` | Key-value store interface with `ReadConsistency` / `WriteStrategy` enums |
+| `kvserver.py` | KV server; supports leaseholder (`--is-leaseholder`) and CP/AP strategies |
+| `kvclient.py` | KV client; `put` / `get` with `--strategy` and `--consistency` |
+| `tests/test_cap.py` | 7 tests: quorum, CP vs AP, LINEARIZABLE vs FOLLOWER_STALE, LWW |
+| `perf_cap_bench.py` | PACELC benchmark (1000 iterations × 2 scenarios) |
+| `Lab_Report_CAP.pdf` | Lab report — 3 sections (tests, PACELC, conceptual questions) |
+
+### Start 3 KV replicas (A = leaseholder)
+
+```bash
+# terminal 1
+python kvserver.py --port 50051 --replica-id A --is-leaseholder
+
+# terminal 2
+python kvserver.py --port 50052 --replica-id B
+
+# terminal 3
+python kvserver.py --port 50053 --replica-id C
+```
+
+### KV client
+
+```bash
+# CP write (requires majority)
+python kvclient.py put foo bar --strategy cp --replicas 50051,50052,50053
+
+# AP write (any single node)
+python kvclient.py put foo bar --strategy ap --port 50053
+
+# LINEARIZABLE read (must hit leaseholder)
+python kvclient.py get foo --consistency linearizable --port 50051
+
+# FOLLOWER_STALE read (any replica; bounded staleness)
+python kvclient.py get foo --consistency stale --max-staleness-ms 5000 --port 50052
+```
+
+### Run CAP tests
+
+```bash
+pytest tests/test_cap.py -v        # 7 tests, all green
+pytest tests/ -v                   # 18 tests (11 from Assignment 2 + 7 CAP)
+```
+
+### Run PACELC benchmark
+
+```bash
+python perf_cap_bench.py
+```
+
+Expected output: median / p95 / availability for LINEARIZABLE and FOLLOWER_STALE
+across 1000 iterations each.
